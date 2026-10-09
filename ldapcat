@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Export this lab's cn=config (0) and directory database (1) safely."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def export_database(container, number, destination):
+    with destination.open('xb') as output:
+        os.chmod(destination, 0o600)
+        result = subprocess.run(
+            ['docker', 'exec', container, 'slapcat', '-n', str(number)],
+            stdout=output, stderr=subprocess.PIPE, timeout=300)
+        output.flush()
+        os.fsync(output.fileno())
+    if result.returncode:
+        # Do not echo LDAP diagnostics that might contain directory secrets.
+        raise RuntimeError(f'slapcat database {number} failed (exit {result.returncode}); check container availability and Docker permissions')
+
+
+def describe_file(path):
+    digest = hashlib.sha256()
+    entries = 0
+    size = 0
+    with path.open('rb') as stream:
+        for line in stream:
+            digest.update(line)
+            size += len(line)
+            if line.startswith((b'dn: ', b'dn:: ')):
+                entries += 1
+    if not entries:
+        raise RuntimeError(f'{path.name}: export is empty or contains no LDIF entries')
+    return {'bytes': size, 'entries': entries, 'sha256': digest.hexdigest()}
+
+
+def backup(destination, container):
+    destination = Path(destination).expanduser().resolve()
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc).isoformat()
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    stage = Path(tempfile.mkdtemp(prefix=f'.ldapcat-{stamp}-', dir=destination))
+    os.chmod(stage, 0o700)
+    try:
+        files = {}
+        for number, name in [(0, 'config.ldif'), (1, 'data.ldif')]:
+            target = stage / name
+            export_database(container, number, target)
+            os.chmod(target, 0o600)
+            files[name] = describe_file(target)
+        manifest = {
+            'format': 1, 'container': container,
+            'started_utc': started, 'finished_utc': datetime.now(timezone.utc).isoformat(),
+            'databases': {'config.ldif': 0, 'data.ldif': 1}, 'files': files,
+            'consistency': 'Sequential live exports, not an atomic cross-database snapshot. Avoid writes/config changes during backup.',
+            'scope': 'LDAP only; excludes Docker Compose, web app, external TLS/key files and any additional databases.'
+        }
+        with (stage / 'manifest.json').open('x') as stream:
+            os.chmod(stage / 'manifest.json', 0o600)
+            json.dump(manifest, stream, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        final = destination / stage.name[1:]
+        if final.exists():
+            raise RuntimeError('Backup name collision; refusing to overwrite')
+        stage.rename(final)
+        return final
+    except BaseException:
+        shutil.rmtree(stage)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Export this OpenLDAP lab's configuration/schema (database 0) and all directory data (database 1) to a private timestamped subfolder.",
+        epilog='Requires Python 3, Docker access, and a writable destination. Includes password hashes: protect backups. Does not stop LDAP; avoid writes during export. Does not include WebUI/Compose/TLS files or extra databases.')
+    parser.add_argument('destination', help='Host backup directory, for example /opt/backup/')
+    parser.add_argument('--container', default=os.environ.get('LDAPCAT_CONTAINER', 'openldap-webapp-ldap'), help='Docker container (default: openldap-webapp-ldap or LDAPCAT_CONTAINER)')
+    args = parser.parse_args()
+    try:
+        result = backup(args.destination, args.container)
+    except KeyboardInterrupt:
+        print('ldapcat: interrupted; incomplete export removed.', file=sys.stderr)
+        return 130
+    except PermissionError:
+        print('ldapcat: permission denied. Use a writable destination, or have an administrator create it for your user.', file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'ldapcat: backup failed: {error}', file=sys.stderr)
+        return 1
+    print(f'LDAP backup complete: {result}')
+    print('  config.ldif   configuration, schema, ACLs, overlays (database 0)')
+    print('  data.ldif     all directory entries and attributes (database 1)')
+    print('  manifest.json  timestamps, entry counts, SHA-256 checksums')
+    print('Sensitive backup: contains password hashes; directory mode 700, files 600.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
